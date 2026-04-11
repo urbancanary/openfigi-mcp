@@ -18,7 +18,9 @@ import requests
 
 logger = logging.getLogger("openfigi-mcp.supabase")
 
-AUTH_MCP_URL = os.environ.get("AUTH_MCP_URL", "https://auth-mcp.urbancanary.workers.dev")
+AUTH_MCP_URL = os.environ.get("AUTH_MCP_URL", "")
+if not AUTH_MCP_URL:
+    raise RuntimeError("Configuration missing")
 
 _cfg: Dict[str, str] = {}
 
