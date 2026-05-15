@@ -44,6 +44,7 @@ class EnrichRequest(BaseModel):
     max_isins: int = 500
     include_recheck: bool = False
     dry_run: bool = False
+    backfill_composite_figi: bool = False
 
 
 class FigiResult(BaseModel):
@@ -90,11 +91,26 @@ def _build_result(isin: str, hit: Optional[Dict], ref_row: Optional[Dict]) -> Fi
     )
 
 
-def _select_unchecked_isins(limit: int, include_recheck: bool) -> List[str]:
+def _select_unchecked_isins(
+    limit: int, include_recheck: bool, backfill_composite_figi: bool = False
+) -> List[str]:
     """Pull ISINs from bond_reference that need OpenFIGI enrichment."""
     from datetime import timedelta
 
     RECHECK_AFTER_DAYS = 30
+
+    if backfill_composite_figi:
+        # Backfill mode: target rows that have a figi but are missing composite_figi
+        rows = get_rows(
+            "bond_reference",
+            {
+                "select": "isin",
+                "figi": "not.is.null",
+                "composite_figi": "is.null",
+            },
+            page_size=1000,
+        )
+        return [r["isin"] for r in rows][:limit]
 
     # Unchecked rows first
     rows = get_rows(
@@ -217,6 +233,7 @@ def enrich(req: EnrichRequest):
             isins = _select_unchecked_isins(
                 limit=req.max_isins,
                 include_recheck=req.include_recheck,
+                backfill_composite_figi=req.backfill_composite_figi,
             )
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Could not fetch ISINs: {e}")
