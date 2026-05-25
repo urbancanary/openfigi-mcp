@@ -44,6 +44,7 @@ class EnrichRequest(BaseModel):
     max_isins: int = 500
     include_recheck: bool = False
     dry_run: bool = False
+    backfill_missing_composite_figi: bool = False
 
 
 class FigiResult(BaseModel):
@@ -122,6 +123,20 @@ def _select_unchecked_isins(limit: int, include_recheck: bool) -> List[str]:
                 seen.add(r["isin"])
 
     return isins[:limit]
+
+
+def _select_missing_composite_figi_isins(limit: int) -> List[str]:
+    """Pull ISINs from bond_reference that have a FIGI but lack composite_figi."""
+    rows = get_rows(
+        "bond_reference",
+        {
+            "select": "isin",
+            "figi": "not.is.null",
+            "composite_figi": "is.null",
+        },
+        page_size=1000,
+    )
+    return [r["isin"] for r in rows][:limit]
 
 
 def _write_hits(isins: List[str], hits: Dict[str, Dict], dry_run: bool) -> int:
@@ -212,6 +227,11 @@ def enrich(req: EnrichRequest):
     # Determine work list
     if req.isins:
         isins = [i.strip().upper() for i in req.isins]
+    elif req.backfill_missing_composite_figi:
+        try:
+            isins = _select_missing_composite_figi_isins(limit=req.max_isins)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Could not fetch ISINs: {e}")
     else:
         try:
             isins = _select_unchecked_isins(
