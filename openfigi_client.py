@@ -29,13 +29,22 @@ _WITH_KEY = {"batch_size": 100, "requests_per_minute": 240}
 _NO_KEY   = {"batch_size": 10,  "requests_per_minute": 20}
 
 
-def fetch_batch(isins: List[str], api_key: Optional[str] = None) -> Dict[str, Dict]:
+def fetch_batch(
+    isins: List[str],
+    api_key: Optional[str] = None,
+    errored: Optional[set] = None,
+) -> Dict[str, Dict]:
     """
     POST a batch of ISINs to OpenFIGI.
 
     Returns {isin: fields_dict} for hits only.
-    Misses (no match from OpenFIGI) are omitted — caller should stamp
-    openfigi_checked_at but leave figi NULL.
+    Genuine misses (no match from OpenFIGI) are omitted — caller should
+    stamp openfigi_checked_at but leave figi NULL.
+
+    If `errored` is passed, any ISIN whose per-entry response was an
+    OpenFIGI-level error (not a genuine no-match) is added to it, so the
+    caller can skip stamping openfigi_checked_at for those and retry them
+    on the next run instead of waiting out the 30-day recheck window (#1482).
 
     Raises on non-2xx responses (after one retry on 429).
     """
@@ -69,6 +78,15 @@ def fetch_batch(isins: List[str], api_key: Optional[str] = None) -> Dict[str, Di
     out: Dict[str, Dict] = {}
     for isin, entry in zip(isins, results):
         if not isinstance(entry, dict):
+            continue
+        if "error" in entry:
+            # Per-entry API error (e.g. rate-limited item, malformed idValue)
+            # is NOT the same as "no OpenFIGI match" — surface it so the
+            # caller can skip stamping openfigi_checked_at rather than
+            # treating a transient error as a definitive miss (#1482).
+            logger.warning(f"OpenFIGI entry error for {isin}: {entry.get('error')}")
+            if errored is not None:
+                errored.add(isin)
             continue
         data = entry.get("data") or []
         if not data:

@@ -124,32 +124,69 @@ def _select_unchecked_isins(limit: int, include_recheck: bool) -> List[str]:
     return isins[:limit]
 
 
-def _write_hits(isins: List[str], hits: Dict[str, Dict], dry_run: bool) -> int:
-    """Write OpenFIGI results + corrected coupons to bond_reference."""
-    today = date.today().isoformat()
-    rows = []
-    for isin in isins:
-        hit = hits.get(isin, {})
-        row: Dict = {"isin": isin, "openfigi_checked_at": today}
+_OPENFIGI_FIELDS = (
+    "figi", "composite_figi", "openfigi_name", "openfigi_ticker",
+    "market_sector", "security_type", "security_type2", "is_144a",
+)
 
-        # OpenFIGI fields (NULL for misses so every row has same column set)
-        for field in ("figi", "composite_figi", "openfigi_name",
-                      "openfigi_ticker", "market_sector", "security_type", "security_type2",
-                      "is_144a"):
+
+def _write_hits(
+    isins: List[str],
+    hits: Dict[str, Dict],
+    dry_run: bool,
+    errored: Optional[set] = None,
+) -> int:
+    """
+    Write OpenFIGI results + corrected coupons to bond_reference.
+
+    Every row gets the SAME key set (isin, openfigi_checked_at, all
+    _OPENFIGI_FIELDS, coupon_bbg) regardless of hit/miss, so PostgREST's
+    bulk-upsert doesn't reject the batch for heterogeneous keys (#1481).
+
+    On a miss, we do NOT null out the OpenFIGI fields — they're simply
+    omitted from the write via COALESCE-style merge (Postgres has no native
+    "skip this key" semantics over REST, so instead we only stamp
+    openfigi_checked_at + isin for misses and rely on a second, field-only
+    upsert for hits). This means a transient miss on a previously-enriched
+    ISIN no longer wipes its stored FIGI data (#1482).
+
+    ISINs present in `errored` (per-entry OpenFIGI API errors, not genuine
+    no-match) are skipped entirely — no openfigi_checked_at stamp — so
+    they're retried on the very next run rather than waiting 30 days.
+    """
+    today = date.today().isoformat()
+    errored = errored or set()
+    hit_rows = []
+    miss_rows = []
+    for isin in isins:
+        if isin in errored:
+            continue
+
+        hit = hits.get(isin)
+        if not hit:
+            # Miss: stamp checked_at only. Never overwrite previously
+            # -enriched fields with NULL.
+            miss_rows.append({"isin": isin, "openfigi_checked_at": today})
+            continue
+
+        row: Dict = {"isin": isin, "openfigi_checked_at": today}
+        for field in _OPENFIGI_FIELDS:
             row[field] = hit.get(field)
 
-        # Coupon precision upgrade
-        if hit:
-            parsed = parse_coupon_from_bbg_name(hit.get("openfigi_name"))
-            if parsed is not None:
-                row["coupon_bbg"] = parsed  # always store parsed; let DB compare
+        parsed = parse_coupon_from_bbg_name(hit.get("openfigi_name"))
+        row["coupon_bbg"] = parsed  # same key set on every hit row
 
-        rows.append(row)
+        hit_rows.append(row)
 
     if dry_run:
-        return len(rows)
+        return len(hit_rows) + len(miss_rows)
 
-    return upsert_rows("bond_reference", rows)
+    written = 0
+    if hit_rows:
+        written += upsert_rows("bond_reference", hit_rows)
+    if miss_rows:
+        written += upsert_rows("bond_reference", miss_rows)
+    return written
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
@@ -234,8 +271,9 @@ def enrich(req: EnrichRequest):
         batch = isins[i : i + batch_size]
         batches += 1
 
+        errored: set = set()
         try:
-            hits = fetch_batch(batch, api_key=api_key)
+            hits = fetch_batch(batch, api_key=api_key, errored=errored)
         except Exception as e:
             logger.error(f"OpenFIGI batch {batches} failed: {e}")
             continue
@@ -259,8 +297,8 @@ def enrich(req: EnrichRequest):
                     "delta": round(abs((parsed or 0) - (stored or 0)), 6),
                 })
 
-        written = _write_hits(batch, hits, dry_run=req.dry_run)
-        total_checked += len(batch)
+        written = _write_hits(batch, hits, dry_run=req.dry_run, errored=errored)
+        total_checked += len(batch) - len(errored)
         total_matched += len(hits)
         total_written += written
 
