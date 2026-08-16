@@ -6,15 +6,15 @@ Credentials are fetched once at startup from auth-mcp and cached in module state
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
-import secrets
 import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
 import requests
+
+from token_utils import generate_token
 
 logger = logging.getLogger("openfigi-mcp.supabase")
 
@@ -25,26 +25,35 @@ if not AUTH_MCP_URL:
 _cfg: Dict[str, str] = {}
 
 
-def _token() -> str:
-    r = secrets.token_hex(8)
-    return f"{r}-{hashlib.sha256(r.encode()).hexdigest()[:8]}"
-
-
 def _get_key(name: str) -> str:
-    """Fetch from auth-mcp, fall back to env var."""
+    """
+    Fetch a key from auth-mcp.
+
+    Does NOT silently fall back to os.environ — a missing/unreachable
+    auth-mcp must be visible (log + raise), not masked, since a silent
+    fallback here previously caused OPENFIGI_API_KEY lookups to downgrade
+    to unauthenticated OpenFIGI mode (10 ISINs/req, 20 req/min vs
+    100/240 — a ~100x throughput drop) with zero signal anywhere (#1484).
+    """
     try:
         resp = requests.get(
             f"{AUTH_MCP_URL}/api/key/{name}",
-            headers={"Authorization": f"Bearer {_token()}"},
+            headers={"Authorization": f"Bearer {generate_token()}"},
             timeout=5,
         )
-        if resp.status_code == 200:
-            val = resp.json().get("value", "")
-            if val:
-                return val
-    except Exception:
-        pass
-    return os.environ.get(name, "")
+    except Exception as e:
+        logger.error(f"auth-mcp unreachable fetching key {name!r}: {e}")
+        raise RuntimeError(f"auth-mcp unreachable fetching key {name!r}") from e
+
+    if resp.status_code != 200:
+        logger.error(f"auth-mcp returned {resp.status_code} fetching key {name!r}")
+        raise RuntimeError(f"auth-mcp returned {resp.status_code} fetching key {name!r}")
+
+    val = resp.json().get("value", "")
+    if not val:
+        logger.error(f"auth-mcp has no value for key {name!r}")
+        raise RuntimeError(f"auth-mcp has no value for key {name!r}")
+    return val
 
 
 def _ensure_config() -> None:

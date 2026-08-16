@@ -90,6 +90,23 @@ def _build_result(isin: str, hit: Optional[Dict], ref_row: Optional[Dict]) -> Fi
     )
 
 
+def _get_openfigi_key() -> Optional[str]:
+    """
+    Resolve OPENFIGI_API_KEY from auth-mcp for the current request.
+
+    This key is optional — its absence degrades to unauthenticated OpenFIGI
+    mode (10 ISINs/req, 20 req/min vs 100/240) rather than failing the
+    request, but that degrade must be LOGGED loudly (not silent) so it's
+    visible in Railway logs / ops probes rather than masking auth-mcp
+    being down (#1484).
+    """
+    try:
+        return _get_key("OPENFIGI_API_KEY")
+    except Exception as e:
+        logger.warning(f"OPENFIGI_API_KEY unavailable — degrading to unauthenticated OpenFIGI mode: {e}")
+        return None
+
+
 def _select_unchecked_isins(limit: int, include_recheck: bool) -> List[str]:
     """Pull ISINs from bond_reference that need OpenFIGI enrichment."""
     from datetime import timedelta
@@ -203,7 +220,7 @@ def lookup(isin: str):
     Useful for ad-hoc checks and coupon verification.
     """
     isin = isin.strip().upper()
-    api_key = _get_key("OPENFIGI_API_KEY") or None
+    api_key = _get_openfigi_key()
 
     try:
         hits = fetch_batch([isin], api_key=api_key)
@@ -241,7 +258,7 @@ def enrich(req: EnrichRequest):
 
     Returns summary stats and a sample of coupon upgrades found.
     """
-    api_key = _get_key("OPENFIGI_API_KEY") or None
+    api_key = _get_openfigi_key()
     rate = rate_params(api_key)
     batch_size = rate["batch_size"]
     sleep_between = 60.0 / rate["requests_per_minute"]
