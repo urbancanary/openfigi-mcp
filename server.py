@@ -293,7 +293,7 @@ def ops_probes():
                         "detail": f"degrades to unauthenticated OpenFIGI mode (~25x slower): {e}"})
 
     try:
-        rows = get_rows("bond_reference", {"select": "isin"}, page_size=1)
+        get_rows("bond_reference", {"select": "isin"}, page_size=1)
         probes.append({"id": "supabase", "status": "green",
                         "value": "reachable", "expected": "reachable", "detail": ""})
     except Exception as e:
