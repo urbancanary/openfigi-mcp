@@ -398,8 +398,9 @@ def enrich(req: EnrichRequest):
     - Writes figi, composite_figi, openfigi_name, openfigi_ticker, market_sector,
       security_type, security_type2, openfigi_checked_at to bond_reference
     - Writes coupon_bbg (parsed from Bloomberg fractional name) when available
-    - Sets coupon = coupon_bbg when the precision gain is material (> 0.001)
-      UNLESS the bond is locked in bond_identity
+    - Does NOT update the coupon column — coupon_bbg is stored alongside the
+      existing coupon so the two can be compared offline. Use GET /coupon-upgrades
+      to find rows with a material difference (> 0.001) and promote manually.
 
     Returns summary stats and a sample of coupon upgrades found.
     """
