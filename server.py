@@ -93,6 +93,38 @@ def _build_result(isin: str, hit: Optional[Dict], ref_row: Optional[Dict]) -> Fi
     )
 
 
+_SLACK_ALERT_CHANNEL_DEFAULT = "#openfigi-alerts"
+_MISS_RATE_ALERT_THRESHOLD = 0.5  # alert if >50% of a run's checked ISINs miss
+
+
+def _notify_slack(message: str) -> bool:
+    """
+    Post an alert to Slack. Never raises — logs and returns False on any
+    failure, since a broken alert path must not break /enrich (#1491).
+    """
+    import os
+    try:
+        token = _get_key("SLACK_BOT_TOKEN")
+    except Exception as e:
+        logger.warning(f"[alert] SLACK_BOT_TOKEN unavailable — can't send alert: {e}")
+        return False
+    channel = os.environ.get("SLACK_ALERT_CHANNEL", _SLACK_ALERT_CHANNEL_DEFAULT)
+    try:
+        r = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+            json={"channel": channel, "text": message},
+            timeout=5,
+        )
+        ok = r.status_code == 200 and r.json().get("ok", False)
+        if not ok:
+            logger.warning(f"[alert] Slack post returned {r.status_code}: {r.text[:200]}")
+        return ok
+    except Exception as e:
+        logger.error(f"[alert] Slack post failed: {type(e).__name__}: {e}")
+        return False
+
+
 def _log_event(event: str, **fields) -> None:
     """
     Emit a structured (logfmt) log line: `event=enrich_start run_id=... n=500`.
@@ -434,6 +466,19 @@ def enrich(req: EnrichRequest):
         written=total_written, batches=batches, coupon_upgrades=len(coupon_upgrades),
         duration_s=round(time.monotonic() - run_start, 2),
     )
+
+    # Silent-decay alert (#1491): a failed batch (continue at line ~380) or a
+    # dropped upsert batch shows up only as written < checked or a high
+    # miss-rate — surface it to Slack instead of letting it hide in the
+    # JSON response nobody persists.
+    if not req.dry_run and total_checked > 0:
+        miss_rate = 1 - (total_matched / total_checked)
+        if miss_rate > _MISS_RATE_ALERT_THRESHOLD or total_written < total_checked:
+            _notify_slack(
+                f":warning: openfigi-mcp run `{run_id}`: checked={total_checked} "
+                f"matched={total_matched} written={total_written} "
+                f"miss_rate={miss_rate:.0%} batches={batches}"
+            )
 
     return {
         "checked": total_checked,
