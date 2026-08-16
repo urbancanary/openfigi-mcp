@@ -34,7 +34,7 @@ logger = logging.getLogger("openfigi-mcp")
 app = FastAPI(title="OpenFIGI MCP", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-VERSION_HASH = "v1_20260410"
+VERSION_HASH = "v1_20260816"
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────
@@ -377,6 +377,25 @@ def coupon_upgrades(
     return {"total": len(upgrades), "upgrades": upgrades[:limit]}
 
 
+def _brian_manifest_base_url() -> str:
+    """
+    Resolve the public base_url for the manifest from auth-mcp instead of
+    hardcoding the internal *.up.railway.app URL (#1489). auth-mcp is the
+    single source of truth so a future vanity-domain move propagates here
+    without a code change; falls back to the current literal (logged) if
+    OPENFIGI_MCP_URL isn't registered yet.
+    """
+    try:
+        return _get_key("OPENFIGI_MCP_URL")
+    except Exception as e:
+        fallback = "https://openfigi-mcp-production.up.railway.app"
+        logger.warning(
+            f"OPENFIGI_MCP_URL not resolvable via auth-mcp ({e}); "
+            f"falling back to literal {fallback} — register it in auth-mcp."
+        )
+        return fallback
+
+
 @app.get("/brian-manifest")
 def brian_manifest():
     return {
@@ -390,7 +409,7 @@ def brian_manifest():
             "Maps ISINs to Bloomberg FIGI identifiers, parses exact fractional coupons "
             "from Bloomberg names, and enriches bond_reference with authoritative static data."
         ),
-        "base_url": "https://openfigi-mcp-production.up.railway.app",
+        "base_url": _brian_manifest_base_url(),
         "capabilities": [
             {
                 "name": "ISIN Lookup",
