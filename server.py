@@ -18,6 +18,7 @@ Endpoints:
 
 import logging
 import time
+import uuid
 from datetime import date
 from typing import Dict, List, Optional
 
@@ -90,6 +91,21 @@ def _build_result(isin: str, hit: Optional[Dict], ref_row: Optional[Dict]) -> Fi
         coupon_updated=coupon_updated,
         matched=True,
     )
+
+
+def _log_event(event: str, **fields) -> None:
+    """
+    Emit a structured (logfmt) log line: `event=enrich_start run_id=... n=500`.
+    Greppable per-run progress/summary lines (#1495) — Railway logs are
+    plain text otherwise and can't answer "what did the last enrich do".
+    """
+    parts = [f"event={event}"]
+    for k, v in fields.items():
+        v_str = str(v)
+        if " " in v_str:
+            v_str = f'"{v_str}"'
+        parts.append(f"{k}={v_str}")
+    logger.info(" ".join(parts))
 
 
 def _get_openfigi_key() -> Optional[str]:
@@ -334,6 +350,9 @@ def enrich(req: EnrichRequest):
 
     Returns summary stats and a sample of coupon upgrades found.
     """
+    run_id = uuid.uuid4().hex[:12]
+    run_start = time.monotonic()
+
     api_key = _get_openfigi_key()
     rate = rate_params(api_key)
     batch_size = rate["batch_size"]
@@ -351,7 +370,14 @@ def enrich(req: EnrichRequest):
         except Exception as e:
             raise HTTPException(status_code=503, detail=f"Could not fetch ISINs: {e}")
 
+    _log_event(
+        "enrich_start", run_id=run_id, n=len(isins), batch_size=batch_size,
+        authed=bool(api_key), dry_run=req.dry_run,
+    )
+
     if not isins:
+        _log_event("enrich_summary", run_id=run_id, checked=0, matched=0, written=0, batches=0,
+                    coupon_upgrades=0, duration_s=round(time.monotonic() - run_start, 2))
         return {"checked": 0, "matched": 0, "coupon_upgrades": 0, "batches": 0}
 
     total_checked = 0
@@ -395,8 +421,19 @@ def enrich(req: EnrichRequest):
         total_matched += len(hits)
         total_written += written
 
+        _log_event(
+            "enrich_batch", run_id=run_id, batch=batches, batch_size=len(batch),
+            matched=len(hits), written=written, errored=len(errored),
+        )
+
         if (i + batch_size) < len(isins):
             time.sleep(sleep_between)
+
+    _log_event(
+        "enrich_summary", run_id=run_id, checked=total_checked, matched=total_matched,
+        written=total_written, batches=batches, coupon_upgrades=len(coupon_upgrades),
+        duration_s=round(time.monotonic() - run_start, 2),
+    )
 
     return {
         "checked": total_checked,
@@ -406,6 +443,7 @@ def enrich(req: EnrichRequest):
         "coupon_upgrades": len(coupon_upgrades),
         "coupon_upgrade_sample": coupon_upgrades[:20],
         "dry_run": req.dry_run,
+        "run_id": run_id,
     }
 
 
