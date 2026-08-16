@@ -10,6 +10,7 @@ Wraps the OpenFIGI free API to:
 
 Endpoints:
   GET  /health
+  GET  /ops/probes             — dependency-aware health for the control room
   GET  /lookup/{isin}          — single-ISIN lookup (no DB write)
   POST /enrich                 — batch enrich into bond_reference
   GET  /brian-manifest
@@ -20,12 +21,13 @@ import time
 from datetime import date
 from typing import Dict, List, Optional
 
+import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from coupon_parser import coupon_precision_gain, parse_coupon_from_bbg_name
-from openfigi_client import fetch_batch, rate_params
+from openfigi_client import OPENFIGI_URL, fetch_batch, rate_params
 from supabase_writer import get_rows, get_single, upsert_rows, _get_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -211,6 +213,80 @@ def _write_hits(
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "openfigi-mcp", "version": VERSION_HASH}
+
+
+@app.get("/ops/probes")
+def ops_probes():
+    """
+    Dependency-aware health for the control room (#1486). Checks:
+      - openfigi-api-key: auth-mcp reachable + OPENFIGI_API_KEY resolvable
+        (its absence silently downgrades throughput ~25x — #1484)
+      - supabase: BOND_DATA_SUPABASE_URL/KEY reachable
+      - openfigi-api: OpenFIGI mapping API reachable
+      - unchecked-backlog: bond_reference rows with openfigi_checked_at IS NULL
+      - mapping-misses: rows checked but figi IS NULL
+      - coupon-upgrades-pending: rows with a material coupon_bbg vs coupon delta
+    """
+    probes = []
+
+    try:
+        _get_key("OPENFIGI_API_KEY")
+        probes.append({"id": "openfigi-api-key", "status": "green",
+                        "value": "resolved", "expected": "resolved", "detail": ""})
+    except Exception as e:
+        probes.append({"id": "openfigi-api-key", "status": "amber",
+                        "value": "unresolved", "expected": "resolved",
+                        "detail": f"degrades to unauthenticated OpenFIGI mode (~25x slower): {e}"})
+
+    try:
+        rows = get_rows("bond_reference", {"select": "isin"}, page_size=1)
+        probes.append({"id": "supabase", "status": "green",
+                        "value": "reachable", "expected": "reachable", "detail": ""})
+    except Exception as e:
+        probes.append({"id": "supabase", "status": "red",
+                        "value": "unreachable", "expected": "reachable", "detail": str(e)})
+
+    try:
+        r = requests.get(OPENFIGI_URL, timeout=5)
+        # OpenFIGI returns 405 on GET to the mapping endpoint — any response
+        # (not a connection failure) means the API is reachable.
+        probes.append({"id": "openfigi-api", "status": "green",
+                        "value": "reachable", "expected": "reachable", "detail": f"HTTP {r.status_code}"})
+    except Exception as e:
+        probes.append({"id": "openfigi-api", "status": "red",
+                        "value": "unreachable", "expected": "reachable", "detail": str(e)})
+
+    try:
+        unchecked = get_rows("bond_reference", {"select": "isin", "openfigi_checked_at": "is.null"}, page_size=1000)
+        probes.append({"id": "unchecked-backlog", "status": "green" if len(unchecked) == 0 else "amber",
+                        "value": len(unchecked), "expected": 0,
+                        "detail": "rows never enriched (openfigi_checked_at IS NULL)"})
+    except Exception as e:
+        probes.append({"id": "unchecked-backlog", "status": "red",
+                        "value": None, "expected": 0, "detail": str(e)})
+
+    try:
+        misses = get_rows("bond_reference",
+                           {"select": "isin", "openfigi_checked_at": "not.is.null", "figi": "is.null"},
+                           page_size=1000)
+        probes.append({"id": "mapping-misses", "status": "green",
+                        "value": len(misses), "expected": "low", "detail": "checked but no OpenFIGI match"})
+    except Exception as e:
+        probes.append({"id": "mapping-misses", "status": "red",
+                        "value": None, "expected": "low", "detail": str(e)})
+
+    try:
+        upgrades = coupon_upgrades(limit=1)
+        probes.append({"id": "coupon-upgrades-pending", "status": "green",
+                        "value": upgrades["total"], "expected": "low", "detail": ""})
+    except Exception as e:
+        probes.append({"id": "coupon-upgrades-pending", "status": "red",
+                        "value": None, "expected": "low", "detail": str(e)})
+
+    statuses = {p["status"] for p in probes}
+    overall = "red" if "red" in statuses else ("amber" if "amber" in statuses else "green")
+
+    return {"app": "openfigi-mcp", "overall": overall, "probes": probes}
 
 
 @app.get("/lookup/{isin}", response_model=FigiResult)
