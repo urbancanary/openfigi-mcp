@@ -16,6 +16,7 @@ as OPENFIGI_API_KEY.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from typing import Dict, List, Optional
 
@@ -28,16 +29,40 @@ OPENFIGI_URL = "https://api.openfigi.com/v3/mapping"
 _WITH_KEY = {"batch_size": 100, "requests_per_minute": 240}
 _NO_KEY   = {"batch_size": 10,  "requests_per_minute": 20}
 
+_MAX_ATTEMPTS = 4
+_BASE_DELAY_S = 2.0
+_MAX_DELAY_S = 30.0
 
-def fetch_batch(isins: List[str], api_key: Optional[str] = None) -> Dict[str, Dict]:
+
+def _backoff_delay(attempt: int, retry_after: Optional[float]) -> float:
+    """Exponential backoff with jitter, honouring Retry-After when present."""
+    if retry_after is not None:
+        return max(retry_after, 0.0)
+    delay = min(_BASE_DELAY_S * (2 ** attempt), _MAX_DELAY_S)
+    return delay * (0.5 + random.random())  # jitter: 0.5x-1.5x
+
+
+def fetch_batch(
+    isins: List[str],
+    api_key: Optional[str] = None,
+    errored: Optional[set] = None,
+) -> Dict[str, Dict]:
     """
     POST a batch of ISINs to OpenFIGI.
 
     Returns {isin: fields_dict} for hits only.
-    Misses (no match from OpenFIGI) are omitted — caller should stamp
-    openfigi_checked_at but leave figi NULL.
+    Genuine misses (no match from OpenFIGI) are omitted — caller should
+    stamp openfigi_checked_at but leave figi NULL.
 
-    Raises on non-2xx responses (after one retry on 429).
+    If `errored` is passed, any ISIN whose per-entry response was an
+    OpenFIGI-level error (not a genuine no-match) is added to it, so the
+    caller can skip stamping openfigi_checked_at for those and retry them
+    on the next run instead of waiting out the 30-day recheck window (#1482).
+
+    Retries up to _MAX_ATTEMPTS times with exponential backoff + jitter on
+    429, 5xx, timeouts, and connection errors; honours the Retry-After
+    header on 429 when present. Raises on a non-2xx response after the
+    final attempt, or on the final connection/timeout error (#1493).
     """
     if not isins:
         return {}
@@ -49,13 +74,42 @@ def fetch_batch(isins: List[str], api_key: Optional[str] = None) -> Dict[str, Di
     payload = [{"idType": "ID_ISIN", "idValue": isin} for isin in isins]
 
     resp = None
-    for attempt in range(2):
-        resp = requests.post(OPENFIGI_URL, json=payload, headers=headers, timeout=30)
-        if resp.status_code == 429:
-            logger.warning("OpenFIGI 429 — sleeping 6 s then retrying")
-            time.sleep(6)
-            continue
-        break
+    last_exc: Optional[Exception] = None
+    for attempt in range(_MAX_ATTEMPTS):
+        last_exc = None
+        try:
+            resp = requests.post(OPENFIGI_URL, json=payload, headers=headers, timeout=30)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            resp = None
+        else:
+            if resp.status_code == 200:
+                break
+            if resp.status_code == 429 or resp.status_code >= 500:
+                pass  # retryable, fall through to backoff below
+            else:
+                break  # non-retryable 4xx — don't waste attempts
+
+        if attempt == _MAX_ATTEMPTS - 1:
+            break
+
+        retry_after = None
+        if resp is not None and resp.status_code == 429:
+            ra = resp.headers.get("Retry-After")
+            if ra is not None:
+                try:
+                    retry_after = float(ra)
+                except ValueError:
+                    retry_after = None
+
+        delay = _backoff_delay(attempt, retry_after)
+        reason = f"HTTP {resp.status_code}" if resp is not None else repr(last_exc)
+        logger.warning(f"OpenFIGI request failed ({reason}) — attempt {attempt + 1}/{_MAX_ATTEMPTS}, retrying in {delay:.1f}s")
+        time.sleep(delay)
+
+    if last_exc is not None:
+        logger.error(f"OpenFIGI request failed after {_MAX_ATTEMPTS} attempts: {last_exc}")
+        raise last_exc
 
     if resp is None or resp.status_code != 200:
         status = resp.status_code if resp is not None else "N/A"
@@ -69,6 +123,15 @@ def fetch_batch(isins: List[str], api_key: Optional[str] = None) -> Dict[str, Di
     out: Dict[str, Dict] = {}
     for isin, entry in zip(isins, results):
         if not isinstance(entry, dict):
+            continue
+        if "error" in entry:
+            # Per-entry API error (e.g. rate-limited item, malformed idValue)
+            # is NOT the same as "no OpenFIGI match" — surface it so the
+            # caller can skip stamping openfigi_checked_at rather than
+            # treating a transient error as a definitive miss (#1482).
+            logger.warning(f"OpenFIGI entry error for {isin}: {entry.get('error')}")
+            if errored is not None:
+                errored.add(isin)
             continue
         data = entry.get("data") or []
         if not data:
