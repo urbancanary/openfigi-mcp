@@ -76,12 +76,20 @@ def _rest(path: str) -> str:
 # ── Public API ─────────────────────────────────────────────────────────────
 
 def get_rows(table: str, params: Dict[str, str], page_size: int = 1000) -> List[Dict]:
-    """Paginated SELECT from a Supabase table."""
+    """
+    Paginated SELECT from a Supabase table.
+
+    Orders by `isin` (falling back to whatever `params["order"]` the caller
+    supplies) so limit/offset pages are stable — without an ORDER BY,
+    Postgres is free to return rows in different order per query, which
+    silently skips or duplicates rows across page boundaries (#1488).
+    """
     _ensure_config()
+    order = params.get("order", "isin")
     out: List[Dict] = []
     offset = 0
     while True:
-        p = {**params, "limit": str(page_size), "offset": str(offset)}
+        p = {**params, "order": order, "limit": str(page_size), "offset": str(offset)}
         resp = requests.get(_rest(table), headers=_headers(), params=p, timeout=30)
         if not resp.ok:
             resp.raise_for_status()
