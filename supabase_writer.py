@@ -8,15 +8,54 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import time
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
 from token_utils import generate_token
 
 logger = logging.getLogger("openfigi-mcp.supabase")
+
+_MAX_ATTEMPTS = 3
+_BASE_DELAY_S = 1.5
+
+
+def _with_retry(fn: Callable[[], requests.Response], desc: str) -> requests.Response:
+    """
+    Retry a Supabase REST call up to _MAX_ATTEMPTS times with exponential
+    backoff on 5xx/timeout/connection errors. Escalates to logger.error
+    (not just warning) once retries are exhausted, so a persistent failure
+    is visible rather than a single warning string buried in Railway
+    logs (#1494).
+    """
+    last_exc: Optional[Exception] = None
+    resp: Optional[requests.Response] = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            resp = fn()
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            resp = None
+        else:
+            last_exc = None
+            if resp.status_code < 500:
+                return resp
+
+        if attempt == _MAX_ATTEMPTS - 1:
+            break
+        delay = _BASE_DELAY_S * (2 ** attempt) * (0.5 + random.random())
+        reason = f"HTTP {resp.status_code}" if resp is not None else repr(last_exc)
+        logger.warning(f"{desc} failed ({reason}) — attempt {attempt + 1}/{_MAX_ATTEMPTS}, retrying in {delay:.1f}s")
+        time.sleep(delay)
+
+    if last_exc is not None:
+        logger.error(f"{desc} failed after {_MAX_ATTEMPTS} attempts: {last_exc}")
+        raise last_exc
+    logger.error(f"{desc} failed after {_MAX_ATTEMPTS} attempts: HTTP {resp.status_code}")
+    return resp
 
 AUTH_MCP_URL = os.environ.get("AUTH_MCP_URL", "")
 if not AUTH_MCP_URL:
@@ -99,7 +138,10 @@ def get_rows(table: str, params: Dict[str, str], page_size: int = 1000) -> List[
     offset = 0
     while True:
         p = {**params, "order": order, "limit": str(page_size), "offset": str(offset)}
-        resp = requests.get(_rest(table), headers=_headers(), params=p, timeout=30)
+        resp = _with_retry(
+            lambda p=p: requests.get(_rest(table), headers=_headers(), params=p, timeout=30),
+            desc=f"get_rows({table})",
+        )
         if not resp.ok:
             resp.raise_for_status()
         rows = resp.json()
@@ -120,27 +162,37 @@ def upsert_rows(table: str, rows: List[Dict], on_conflict: str = "isin") -> int:
     total = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i : i + batch_size]
-        resp = requests.post(
-            f"{_rest(table)}?on_conflict={on_conflict}",
-            headers=_headers(prefer="resolution=merge-duplicates,return=minimal"),
-            json=batch,
-            timeout=30,
-        )
+        try:
+            resp = _with_retry(
+                lambda batch=batch: requests.post(
+                    f"{_rest(table)}?on_conflict={on_conflict}",
+                    headers=_headers(prefer="resolution=merge-duplicates,return=minimal"),
+                    json=batch,
+                    timeout=30,
+                ),
+                desc=f"upsert_rows({table})",
+            )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            logger.error(f"upsert {table} batch dropped after retries: {e}")
+            continue
         if resp.ok:
             total += len(batch)
         else:
-            logger.warning(f"upsert {table} batch failed: {resp.status_code} {resp.text[:200]}")
+            logger.error(f"upsert {table} batch failed: {resp.status_code} {resp.text[:200]}")
     return total
 
 
 def get_single(table: str, isin: str) -> Optional[Dict]:
     """Fetch a single row by ISIN."""
     _ensure_config()
-    resp = requests.get(
-        _rest(table),
-        headers=_headers(),
-        params={"isin": f"eq.{isin}", "limit": "1"},
-        timeout=10,
+    resp = _with_retry(
+        lambda: requests.get(
+            _rest(table),
+            headers=_headers(),
+            params={"isin": f"eq.{isin}", "limit": "1"},
+            timeout=10,
+        ),
+        desc=f"get_single({table})",
     )
     if not resp.ok:
         resp.raise_for_status()
