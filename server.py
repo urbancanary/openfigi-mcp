@@ -25,6 +25,7 @@ from typing import Dict, List, Optional
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from coupon_parser import coupon_precision_gain, parse_coupon_from_bbg_name
@@ -37,7 +38,12 @@ logger = logging.getLogger("openfigi-mcp")
 app = FastAPI(title="OpenFIGI MCP", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-VERSION_HASH = "v1_20260816"
+VERSION_HASH = "v1_20260816b"
+
+# In-memory only (no run-history table yet — that's a separate, larger
+# design item). Reset on every deploy/restart; good enough for "what did
+# the last enrich do" between restarts.
+_last_run: Dict = {}
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────
@@ -324,7 +330,7 @@ def ops_probes():
                         "value": None, "expected": "low", "detail": str(e)})
 
     try:
-        upgrades = coupon_upgrades(limit=1)
+        upgrades = _coupon_upgrades(limit=1)
         probes.append({"id": "coupon-upgrades-pending", "status": "green",
                         "value": upgrades["total"], "expected": "low", "detail": ""})
     except Exception as e:
@@ -480,7 +486,7 @@ def enrich(req: EnrichRequest):
                 f"miss_rate={miss_rate:.0%} batches={batches}"
             )
 
-    return {
+    result = {
         "checked": total_checked,
         "matched": total_matched,
         "written": total_written,
@@ -490,20 +496,21 @@ def enrich(req: EnrichRequest):
         "dry_run": req.dry_run,
         "run_id": run_id,
     }
+    if not req.dry_run:
+        _last_run.update(result)
+        _last_run["completed_at"] = date.today().isoformat()
+    return result
 
 
-@app.get("/coupon-upgrades")
-def coupon_upgrades(
-    limit: int = Query(default=100, le=1000),
-    min_delta: float = Query(default=0.001),
-):
-    """
-    List bonds where the Bloomberg fractional coupon (coupon_bbg) differs
-    materially from the stored coupon — these are candidates for correction.
+_coupon_rows_cache: Dict = {"rows": None, "at": 0.0}
+_COUPON_ROWS_CACHE_TTL_S = 300  # /coupon-upgrades re-pages the whole
+# coupon_bbg-populated table on every call; cache it so the status page
+# (#1490) can poll it without re-paging bond_reference on every load.
 
-    Requires coupon_bbg column to be populated in bond_reference (run /enrich first).
-    """
-    try:
+
+def _cached_coupon_rows() -> List[Dict]:
+    now = time.monotonic()
+    if _coupon_rows_cache["rows"] is None or (now - _coupon_rows_cache["at"]) > _COUPON_ROWS_CACHE_TTL_S:
         rows = get_rows(
             "bond_reference",
             {
@@ -513,6 +520,20 @@ def coupon_upgrades(
             },
             page_size=1000,
         )
+        _coupon_rows_cache["rows"] = rows
+        _coupon_rows_cache["at"] = now
+    return _coupon_rows_cache["rows"]
+
+
+def _coupon_upgrades(limit: int = 100, min_delta: float = 0.001) -> Dict:
+    """
+    Plain (non-FastAPI) implementation, callable directly from /ops/probes
+    and the status page without FastAPI's Query() defaults getting in the
+    way (calling the route function directly left `min_delta` as an unused
+    Query object, not a float).
+    """
+    try:
+        rows = _cached_coupon_rows()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Could not fetch rows: {e}")
 
@@ -534,6 +555,98 @@ def coupon_upgrades(
 
     upgrades.sort(key=lambda x: x["delta"], reverse=True)
     return {"total": len(upgrades), "upgrades": upgrades[:limit]}
+
+
+@app.get("/coupon-upgrades")
+def coupon_upgrades(
+    limit: int = Query(default=100, le=1000),
+    min_delta: float = Query(default=0.001),
+):
+    """
+    List bonds where the Bloomberg fractional coupon (coupon_bbg) differs
+    materially from the stored coupon — these are candidates for correction.
+
+    Requires coupon_bbg column to be populated in bond_reference (run /enrich first).
+    """
+    return _coupon_upgrades(limit=limit, min_delta=min_delta)
+
+
+def _esc(s) -> str:
+    return "" if s is None else str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+@app.get("/", response_class=HTMLResponse)
+def status_page():
+    """
+    Human-browsable status page (#1490) — FIGI coverage, unchecked backlog,
+    mapping misses, top coupon upgrades, and the last /enrich summary,
+    without needing to run SQL or curl raw JSON.
+    """
+    try:
+        total = len(get_rows("bond_reference", {"select": "isin"}, page_size=1000))
+    except Exception:
+        total = None
+    try:
+        unchecked = len(get_rows("bond_reference", {"select": "isin", "openfigi_checked_at": "is.null"}, page_size=1000))
+    except Exception:
+        unchecked = None
+    try:
+        misses = len(get_rows("bond_reference",
+                               {"select": "isin", "openfigi_checked_at": "not.is.null", "figi": "is.null"},
+                               page_size=1000))
+    except Exception:
+        misses = None
+    matched = (total - unchecked - misses) if None not in (total, unchecked, misses) else None
+
+    try:
+        top_upgrades = _coupon_upgrades(limit=20)["upgrades"]
+    except Exception:
+        top_upgrades = []
+
+    rows_html = "".join(
+        f"<tr><td>{_esc(u['isin'])}</td><td>{_esc(u.get('name'))}</td>"
+        f"<td>{_esc(u['stored'])}</td><td>{_esc(u['bbg'])}</td><td>{_esc(u['delta'])}</td></tr>"
+        for u in top_upgrades
+    ) or "<tr><td colspan=5><em>none</em></td></tr>"
+
+    last_run_html = (
+        f"checked={_esc(_last_run.get('checked'))} matched={_esc(_last_run.get('matched'))} "
+        f"written={_esc(_last_run.get('written'))} coupon_upgrades={_esc(_last_run.get('coupon_upgrades'))} "
+        f"at {_esc(_last_run.get('completed_at'))} (run_id={_esc(_last_run.get('run_id'))})"
+        if _last_run else "no /enrich run since last restart"
+    )
+
+    html = f"""<!DOCTYPE html>
+<html><head><title>OpenFIGI MCP — status</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; margin: 2rem; color: #222; }}
+table {{ border-collapse: collapse; margin-top: 0.5rem; }}
+td, th {{ border: 1px solid #ddd; padding: 4px 10px; text-align: left; font-size: 0.9rem; }}
+.stat {{ display: inline-block; margin-right: 2rem; }}
+.stat b {{ font-size: 1.4rem; display: block; }}
+h2 {{ margin-top: 2rem; }}
+</style></head>
+<body>
+<h1>OpenFIGI MCP</h1>
+<p>version {_esc(VERSION_HASH)}</p>
+
+<div class="stat"><b>{_esc(matched) if matched is not None else '?'}</b>matched</div>
+<div class="stat"><b>{_esc(misses) if misses is not None else '?'}</b>mapping misses</div>
+<div class="stat"><b>{_esc(unchecked) if unchecked is not None else '?'}</b>unchecked backlog</div>
+<div class="stat"><b>{_esc(total) if total is not None else '?'}</b>total bond_reference rows</div>
+
+<h2>Last /enrich run</h2>
+<p>{last_run_html}</p>
+
+<h2>Top coupon upgrades (candidates for static-data correction)</h2>
+<table>
+<tr><th>ISIN</th><th>Name</th><th>Stored</th><th>Bloomberg</th><th>Delta</th></tr>
+{rows_html}
+</table>
+
+<p><a href="/ops/probes">/ops/probes</a> · <a href="/coupon-upgrades">/coupon-upgrades</a> · <a href="/health">/health</a></p>
+</body></html>"""
+    return HTMLResponse(content=html)
 
 
 def _brian_manifest_base_url() -> str:
@@ -612,8 +725,8 @@ def brian_manifest():
             {
                 "id": "main",
                 "name": "OpenFIGI Engine",
-                "path": "/health",
-                "description": "Service health and version info.",
+                "path": "/",
+                "description": "FIGI coverage, unchecked backlog, mapping misses, and top coupon upgrades.",
             }
         ],
         "tour": [
