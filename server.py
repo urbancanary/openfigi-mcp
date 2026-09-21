@@ -23,7 +23,7 @@ from datetime import date
 from typing import Dict, List, Optional
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -36,7 +36,43 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 logger = logging.getLogger("openfigi-mcp")
 
 app = FastAPI(title="OpenFIGI MCP", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# Reads stay open to browsers; the WRITE path (POST /enrich) is never offered
+# cross-origin, and is gated server-side by OPENFIGI_ENRICH_KEY (backlog 1487).
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
+
+# POST /enrich rewrites bond_reference (incl. coupon) and spends the OpenFIGI
+# quota, so it requires X-API-Key == auth-mcp OPENFIGI_ENRICH_KEY. Read once,
+# cached per process, FAIL CLOSED: auth-mcp unreachable or key absent -> 503,
+# never "allow". A miss is retried at most once a minute.
+ENRICH_KEY_NAME = "OPENFIGI_ENRICH_KEY"
+_ENRICH_KEY_RETRY_S = 60.0
+_enrich_key_cache: Dict = {"value": None, "tried_at": None}
+
+
+def _enrich_key() -> Optional[str]:
+    if _enrich_key_cache["value"]:
+        return _enrich_key_cache["value"]
+    now = time.monotonic()
+    tried = _enrich_key_cache["tried_at"]
+    if tried is not None and now - tried < _ENRICH_KEY_RETRY_S:
+        return None
+    _enrich_key_cache["tried_at"] = now
+    try:
+        value = _get_key(ENRICH_KEY_NAME)
+    except Exception:
+        return None  # _get_key has already logged why
+    _enrich_key_cache["value"] = value or None
+    return _enrich_key_cache["value"]
+
+
+def _require_enrich_key(presented: Optional[str]) -> None:
+    import hmac
+    expected = _enrich_key()
+    if not expected:
+        raise HTTPException(status_code=503, detail="enrich is unavailable: its credential could not be loaded")
+    if not presented or not hmac.compare_digest(presented.encode(), expected.encode()):
+        logger.warning("enrich refused: missing or wrong X-API-Key")
+        raise HTTPException(status_code=401, detail="X-API-Key required")
 
 VERSION_HASH = "v1_20260816b"
 
@@ -387,7 +423,7 @@ def lookup(isin: str):
 
 
 @app.post("/enrich")
-def enrich(req: EnrichRequest):
+def enrich(req: EnrichRequest, x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
     """
     Batch-enrich bond_reference rows with OpenFIGI data.
 
@@ -403,6 +439,7 @@ def enrich(req: EnrichRequest):
 
     Returns summary stats and a sample of coupon upgrades found.
     """
+    _require_enrich_key(x_api_key)
     run_id = uuid.uuid4().hex[:12]
     run_start = time.monotonic()
 
