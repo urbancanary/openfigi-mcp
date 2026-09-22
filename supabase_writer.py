@@ -98,7 +98,10 @@ def _get_key(name: str) -> str:
 def _ensure_config() -> None:
     if not _cfg.get("key"):
         _cfg["url"] = _get_key("BOND_DATA_SUPABASE_URL") or _get_key("SUPABASE_URL")
-        _cfg["key"] = _get_key("BOND_DATA_SUPABASE_KEY") or _get_key("SUPABASE_KEY")
+        # Service key first: this module upserts bond_reference and anon's write grant
+        # on it is being revoked (backlog 5044, Andy GO 2026-09-22).
+        _cfg["key"] = (_get_key("BOND_DATA_SUPABASE_SERVICE_KEY") or _get_key("BOND_DATA_SUPABASE_KEY")
+                       or _get_key("SUPABASE_KEY"))
         if not _cfg.get("key"):
             raise RuntimeError(
                 "Supabase credentials not available — "
