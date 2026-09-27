@@ -161,6 +161,36 @@ def _log_event(event: str, **fields) -> None:
 
 _WRITE_KEY_CACHE: Dict[str, str] = {}
 
+# The published inbound credential contract for POST /enrich (#1487).
+#
+# A caller never mints this value — it is the SAME Supabase service-role key
+# the write path already uses, held in auth-mcp. It is named here once, in
+# code, so the manifest, the 401 and the gate cannot drift apart, and so a
+# consuming repo's lane can read the real contract instead of guessing at it
+# (the etf-scraper handoff proposed a Bearer token of unspecified origin —
+# this is that origin).
+#
+# Resolution order is supabase_writer._ensure_config's, which is the only
+# place the value is actually read from auth-mcp; this list documents it and
+# is asserted against that source by test_enrich_auth.py, so a rename in one
+# place cannot silently falsify the published contract.
+ENRICH_KEY_AUTH_MCP_NAMES: tuple = (
+    "BOND_DATA_SUPABASE_SERVICE_KEY",   # preferred: service role, can write
+    "BOND_DATA_SUPABASE_KEY",           # legacy fallback
+    "SUPABASE_KEY",                     # last-resort fallback
+)
+ENRICH_KEY_HEADER = "Authorization: Bearer <key>"
+ENRICH_KEY_ALIAS_HEADER = "X-API-Key: <key>"
+ENRICH_KEY_WHERE = (
+    "Value: the Supabase service-role key published by auth-mcp as "
+    "BOND_DATA_SUPABASE_SERVICE_KEY. Retrieve it with "
+    "GET {AUTH_MCP_URL}/api/key/BOND_DATA_SUPABASE_SERVICE_KEY and send it verbatim "
+    "as the Bearer credential — do not wrap, re-encode or prefix it. If that name "
+    "is unset auth-mcp falls back to BOND_DATA_SUPABASE_KEY, then SUPABASE_KEY; "
+    "callers should read the first name and treat the others as legacy. A wrong or "
+    "absent key returns 401; an unresolvable key on this service returns 503."
+)
+
 
 def _expected_write_key() -> str:
     """
@@ -209,7 +239,14 @@ def _require_write_key(request: Request) -> None:
         logger.warning("write gate: rejected an unauthenticated POST /enrich")
         raise HTTPException(
             status_code=401,
-            detail="Authentication required. Send the enrichment key as 'Authorization: Bearer <key>'.",
+            # Deliberately names the contract but never the value: a caller
+            # that cannot authenticate still needs to know WHICH credential to
+            # go and fetch, otherwise it retries the wrong one forever.
+            detail=(
+                "Authentication required. Send the enrichment key as "
+                f"'{ENRICH_KEY_HEADER}' (or '{ENRICH_KEY_ALIAS_HEADER}'). "
+                + ENRICH_KEY_WHERE
+            ),
         )
 
 
@@ -845,7 +882,7 @@ def brian_manifest():
                 "description": (
                     "Batch-enrich bond_reference with OpenFIGI data. "
                     "Requires the enrichment key as 'Authorization: Bearer <key>' "
-                    "(this is a production write). "
+                    "(this is a production write). " + ENRICH_KEY_WHERE + " "
                     "Processes unchecked ISINs in bulk and writes results back to Supabase. "
                     "Includes coupon_bbg (fractional coupon from Bloomberg name) for "
                     "precision correction of bonds stored to only 2 decimal places."
