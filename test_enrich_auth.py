@@ -166,3 +166,51 @@ def test_require_write_key_helper_accepts_and_rejects(monkeypatch):
     with pytest.raises(HTTPException) as e:
         server._require_write_key(_fake_request({}))
     assert e.value.status_code == 401
+
+
+# ── #1497: the per-ISIN N+1 is gone ────────────────────────────────────────
+
+def test_build_hit_rows_does_not_call_get_single(monkeypatch):
+    """
+    The coupon-upgrade sample used to issue one get_single() per matched ISIN
+    (up to 500 HTTP round trips a batch). One paged read of isin,coupon
+    replaces it.
+    """
+    def _no_per_isin(*a, **k):
+        raise AssertionError("get_single() must not be called per ISIN")
+
+    monkeypatch.setattr(server, "get_single", _no_per_isin)
+    monkeypatch.setattr(server, "_stored_coupons", lambda: {"XS1": 4.38})
+    monkeypatch.setattr(server, "get_rows", lambda *a, **k: [])
+
+    hits = {"XS1": {"openfigi_name": "ARAMCO 4 3/8 04/16/49", "figi": "BBG1"}}
+    result_hits, upgrades, conv_err, checked, matched = server._build_hit_rows(["XS1"], hits, dry_run=False)
+
+    assert checked == 1 and matched == 1 and conv_err == 0
+    assert result_hits["XS1"]["coupon_bbg"] == 4.375
+    assert result_hits["XS1"]["figi"] == "BBG1"
+    assert len(upgrades) == 1 and upgrades[0]["stored"] == 4.38
+
+
+def test_build_hit_rows_dry_run_reads_no_stored_coupons(monkeypatch):
+    """A dry run must not touch the DB at all."""
+    monkeypatch.setattr(server, "_stored_coupons",
+                        lambda: (_ for _ in ()).throw(AssertionError("dry_run must not read the DB")))
+    hits = {"XS1": {"openfigi_name": "ARAMCO 4 3/8 04/16/49"}}
+    _, upgrades, _, _, _ = server._build_hit_rows(["XS1"], hits, dry_run=True)
+    assert upgrades == []
+
+
+def test_unparseable_name_is_counted_not_silently_dropped(monkeypatch):
+    monkeypatch.setattr(server, "_stored_coupons", lambda: {})
+    hits = {"XS1": {"openfigi_name": "NO COUPON HERE"}}
+    _, upgrades, conv_err, _, matched = server._build_hit_rows(["XS1"], hits, dry_run=False)
+    assert conv_err == 1 and matched == 1 and upgrades == []
+
+
+def test_write_rows_keep_the_same_key_set(monkeypatch):
+    """#1481 regression guard: hit and miss rows must not diverge in shape."""
+    monkeypatch.setattr(server, "_stored_coupons", lambda: {})
+    hits = {"XS1": {"openfigi_name": "T 2 7/8 05/15/32"}}
+    rows, _, _, _, _ = server._build_hit_rows(["XS1"], hits, dry_run=False)
+    assert set(rows["XS1"].keys()) == {"isin", "openfigi_checked_at", "coupon_bbg", *server._OPENFIGI_FIELDS}

@@ -264,6 +264,65 @@ def _select_unchecked_isins(limit: int, include_recheck: bool) -> List[str]:
     return isins[:limit]
 
 
+def _stored_coupons() -> Dict[str, object]:
+    """
+    Every stored (isin -> coupon) in one query, for the coupon-upgrade sample.
+
+    The sample loop used to call get_single() per matched ISIN — an N+1 of up
+    to one HTTP round trip per hit (500 for a full batch), the dominant cost
+    of a batch after the OpenFIGI calls themselves (#1497). One paged read of
+    two small columns replaces it.
+    """
+    rows = get_rows("bond_reference", {"select": "isin,coupon"}, page_size=1000)
+    return {r["isin"]: r.get("coupon") for r in rows}
+
+
+def _build_hit_rows(
+    isins: List[str],
+    hits: Dict[str, Dict],
+    dry_run: bool,
+    errored: Optional[set] = None,
+) -> tuple:
+    """
+    Pure work-list construction, split out of the /enrich request handler so
+    the write path is testable without FastAPI.
+
+    Returns (result_hits, coupon_upgrades, total_checked, total_matched).
+    `conversion_errors` counts hits whose OpenFIGI name could not be parsed
+    into a coupon — reported so a parser regression is visible in the run
+    stats rather than silently shrinking the upgrade sample.
+    """
+    errored = errored or set()
+    result_hits: Dict[str, Dict] = {}
+    coupon_upgrades: List[Dict] = []
+    conversion_errors = 0
+
+    stored_coupons = {} if dry_run else _stored_coupons()
+
+    for isin, hit in hits.items():
+        parsed = parse_coupon_from_bbg_name(hit.get("openfigi_name"))
+        if parsed is None:
+            conversion_errors += 1
+        else:
+            stored = stored_coupons.get(isin)
+            if coupon_precision_gain(stored, parsed):
+                coupon_upgrades.append({
+                    "isin": isin,
+                    "name": hit.get("openfigi_name"),
+                    "stored": stored,
+                    "parsed": parsed,
+                    "delta": round(abs((parsed or 0) - (stored or 0)), 6),
+                })
+
+        row: Dict = {"isin": isin, "openfigi_checked_at": date.today().isoformat()}
+        for field in _OPENFIGI_FIELDS:
+            row[field] = hit.get(field)
+        row["coupon_bbg"] = parsed
+        result_hits[isin] = row
+
+    return result_hits, coupon_upgrades, conversion_errors, len(isins) - len(errored), len(hits)
+
+
 def _select_missing_composite_figi_isins(limit: int) -> List[str]:
     """Pull ISINs from bond_reference that have a FIGI but lack composite_figi."""
     rows = get_rows(
@@ -518,6 +577,7 @@ def enrich(req: EnrichRequest, request: Request):
     total_written = 0
     batches = 0
     coupon_upgrades: List[Dict] = []
+    conversion_errors = 0
 
     for i in range(0, len(isins), batch_size):
         batch = isins[i : i + batch_size]
@@ -530,28 +590,17 @@ def enrich(req: EnrichRequest, request: Request):
             logger.error(f"OpenFIGI batch {batches} failed: {e}")
             continue
 
-        # Collect coupon upgrade details before writing
-        for isin, hit in hits.items():
-            parsed = parse_coupon_from_bbg_name(hit.get("openfigi_name"))
-            if parsed is None:
-                continue
-            try:
-                ref = get_single("bond_reference", isin)
-                stored = ref.get("coupon") if ref else None
-            except Exception:
-                stored = None
-            if coupon_precision_gain(stored, parsed):
-                coupon_upgrades.append({
-                    "isin": isin,
-                    "name": hit.get("openfigi_name"),
-                    "stored": stored,
-                    "parsed": parsed,
-                    "delta": round(abs((parsed or 0) - (stored or 0)), 6),
-                })
+        # Collect coupon upgrade details and build the write rows in one pass.
+        # No per-ISIN get_single() here any more (#1497).
+        batch_hits, batch_upgrades, conv_errors, checked_n, matched_n = _build_hit_rows(
+            batch, hits, dry_run=req.dry_run, errored=errored,
+        )
+        coupon_upgrades.extend(batch_upgrades)
+        conversion_errors += conv_errors
 
-        written = _write_hits(batch, hits, dry_run=req.dry_run, errored=errored)
-        total_checked += len(batch) - len(errored)
-        total_matched += len(hits)
+        written = _write_hits(batch, batch_hits, dry_run=req.dry_run, errored=errored)
+        total_checked += checked_n
+        total_matched += matched_n
         total_written += written
 
         _log_event(
@@ -565,6 +614,7 @@ def enrich(req: EnrichRequest, request: Request):
     _log_event(
         "enrich_summary", run_id=run_id, checked=total_checked, matched=total_matched,
         written=total_written, batches=batches, coupon_upgrades=len(coupon_upgrades),
+        conversion_errors=conversion_errors,
         duration_s=round(time.monotonic() - run_start, 2),
     )
 
@@ -588,6 +638,7 @@ def enrich(req: EnrichRequest, request: Request):
         "batches": batches,
         "coupon_upgrades": len(coupon_upgrades),
         "coupon_upgrade_sample": coupon_upgrades[:20],
+        "conversion_errors": conversion_errors,
         "dry_run": req.dry_run,
         "run_id": run_id,
     }
