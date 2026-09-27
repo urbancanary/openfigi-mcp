@@ -12,31 +12,43 @@ Endpoints:
   GET  /health
   GET  /ops/probes             — dependency-aware health for the control room
   GET  /lookup/{isin}          — single-ISIN lookup (no DB write)
-  POST /enrich                 — batch enrich into bond_reference
+  POST /enrich                 — batch enrich into bond_reference (requires key)
   GET  /brian-manifest
 """
 
 import logging
+import secrets
 import time
 import uuid
 from datetime import date
 from typing import Dict, List, Optional
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from coupon_parser import coupon_precision_gain, parse_coupon_from_bbg_name
 from openfigi_client import OPENFIGI_URL, fetch_batch, rate_params
-from supabase_writer import get_rows, get_single, upsert_rows, _get_key
+from supabase_writer import get_rows, get_single, get_service_key, upsert_rows, _get_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("openfigi-mcp")
 
 app = FastAPI(title="OpenFIGI MCP", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# Native/machine callers (the enrichment runs, ops probes, curl) send no
+# Origin header and are unaffected by CORS either way. The browser-facing
+# surface is the status page and /coupon-upgrades — both read-only GETs — so
+# the wildcard is narrowed to those two methods and /enrich is left off the
+# allow-list entirely (#1487). The endpoint also requires a bearer key now,
+# which a cross-origin page cannot obtain.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 VERSION_HASH = "v1_20260816b"
 
@@ -147,6 +159,60 @@ def _log_event(event: str, **fields) -> None:
     logger.info(" ".join(parts))
 
 
+_WRITE_KEY_CACHE: Dict[str, str] = {}
+
+
+def _expected_write_key() -> str:
+    """
+    The credential that authorises a write to bond_reference.
+
+    This is the Supabase service-role key the write path already uses (see
+    supabase_writer._ensure_config) — the ONE credential in this service that
+    a caller cannot mint for itself. Cached after first resolution so a
+    batch run doesn't re-fetch it from auth-mcp per request.
+
+    Backlog #1487/#3074: the endpoint's originally-proposed fix was to gate
+    /enrich with token_utils.validate_token(). That is not access control —
+    validate_token() only recomputes a public SHA256 checksum, so any caller
+    can mint a passing token with token_utils.generate_token(). Gating on it
+    would have falsely closed the item while leaving the write open.
+    """
+    if not _WRITE_KEY_CACHE.get("v"):
+        _WRITE_KEY_CACHE["v"] = get_service_key()
+    return _WRITE_KEY_CACHE["v"]
+
+
+def _require_write_key(request: Request) -> None:
+    """
+    Gate the mutating endpoints (#1487).
+
+    Fails CLOSED: if no expected key is resolvable we refuse the write rather
+    than allow it, because the alternative is the unauthenticated public write
+    this exists to stop. Supplying none and supplying a wrong one get the same
+    401 body — a caller learns nothing about which half was wrong.
+
+    Sent as `Authorization: Bearer <key>` or `X-API-Key: <key>`; compare_digest
+    keeps the comparison constant-time.
+    """
+    auth = request.headers.get("authorization", "")
+    provided = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not provided:
+        provided = request.headers.get("x-api-key", "").strip()
+
+    try:
+        expected = _expected_write_key()
+    except Exception as e:
+        logger.error(f"write gate: no service key resolvable via auth-mcp — refusing write: {e}")
+        raise HTTPException(status_code=503, detail="Enrichment is not configured to authorise writes.")
+
+    if not provided or not secrets.compare_digest(provided, expected):
+        logger.warning("write gate: rejected an unauthenticated POST /enrich")
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Send the enrichment key as 'Authorization: Bearer <key>'.",
+        )
+
+
 def _get_openfigi_key() -> Optional[str]:
     """
     Resolve OPENFIGI_API_KEY from auth-mcp for the current request.
@@ -196,6 +262,65 @@ def _select_unchecked_isins(limit: int, include_recheck: bool) -> List[str]:
                 seen.add(r["isin"])
 
     return isins[:limit]
+
+
+def _stored_coupons() -> Dict[str, object]:
+    """
+    Every stored (isin -> coupon) in one query, for the coupon-upgrade sample.
+
+    The sample loop used to call get_single() per matched ISIN — an N+1 of up
+    to one HTTP round trip per hit (500 for a full batch), the dominant cost
+    of a batch after the OpenFIGI calls themselves (#1497). One paged read of
+    two small columns replaces it.
+    """
+    rows = get_rows("bond_reference", {"select": "isin,coupon"}, page_size=1000)
+    return {r["isin"]: r.get("coupon") for r in rows}
+
+
+def _build_hit_rows(
+    isins: List[str],
+    hits: Dict[str, Dict],
+    dry_run: bool,
+    errored: Optional[set] = None,
+) -> tuple:
+    """
+    Pure work-list construction, split out of the /enrich request handler so
+    the write path is testable without FastAPI.
+
+    Returns (result_hits, coupon_upgrades, total_checked, total_matched).
+    `conversion_errors` counts hits whose OpenFIGI name could not be parsed
+    into a coupon — reported so a parser regression is visible in the run
+    stats rather than silently shrinking the upgrade sample.
+    """
+    errored = errored or set()
+    result_hits: Dict[str, Dict] = {}
+    coupon_upgrades: List[Dict] = []
+    conversion_errors = 0
+
+    stored_coupons = {} if dry_run else _stored_coupons()
+
+    for isin, hit in hits.items():
+        parsed = parse_coupon_from_bbg_name(hit.get("openfigi_name"))
+        if parsed is None:
+            conversion_errors += 1
+        else:
+            stored = stored_coupons.get(isin)
+            if coupon_precision_gain(stored, parsed):
+                coupon_upgrades.append({
+                    "isin": isin,
+                    "name": hit.get("openfigi_name"),
+                    "stored": stored,
+                    "parsed": parsed,
+                    "delta": round(abs((parsed or 0) - (stored or 0)), 6),
+                })
+
+        row: Dict = {"isin": isin, "openfigi_checked_at": date.today().isoformat()}
+        for field in _OPENFIGI_FIELDS:
+            row[field] = hit.get(field)
+        row["coupon_bbg"] = parsed
+        result_hits[isin] = row
+
+    return result_hits, coupon_upgrades, conversion_errors, len(isins) - len(errored), len(hits)
 
 
 def _select_missing_composite_figi_isins(limit: int) -> List[str]:
@@ -387,9 +512,13 @@ def lookup(isin: str):
 
 
 @app.post("/enrich")
-def enrich(req: EnrichRequest):
+def enrich(req: EnrichRequest, request: Request):
     """
     Batch-enrich bond_reference rows with OpenFIGI data.
+
+    Requires the enrichment key (Authorization: Bearer <key>) — this is a
+    production write to bond_reference, so an unauthenticated caller must not
+    be able to trigger it (#1487).
 
     If `isins` is provided, only those ISINs are processed.
     Otherwise pulls unchecked rows from bond_reference (up to max_isins).
@@ -403,6 +532,11 @@ def enrich(req: EnrichRequest):
 
     Returns summary stats and a sample of coupon upgrades found.
     """
+    # Order matters: authorise before _get_openfigi_key()/rate_params() do any
+    # auth-mcp work, and long before the first batch — an unauthenticated
+    # caller must not be able to burn a single OpenFIGI request (#1487).
+    _require_write_key(request)
+
     run_id = uuid.uuid4().hex[:12]
     run_start = time.monotonic()
 
@@ -443,6 +577,7 @@ def enrich(req: EnrichRequest):
     total_written = 0
     batches = 0
     coupon_upgrades: List[Dict] = []
+    conversion_errors = 0
 
     for i in range(0, len(isins), batch_size):
         batch = isins[i : i + batch_size]
@@ -455,28 +590,17 @@ def enrich(req: EnrichRequest):
             logger.error(f"OpenFIGI batch {batches} failed: {e}")
             continue
 
-        # Collect coupon upgrade details before writing
-        for isin, hit in hits.items():
-            parsed = parse_coupon_from_bbg_name(hit.get("openfigi_name"))
-            if parsed is None:
-                continue
-            try:
-                ref = get_single("bond_reference", isin)
-                stored = ref.get("coupon") if ref else None
-            except Exception:
-                stored = None
-            if coupon_precision_gain(stored, parsed):
-                coupon_upgrades.append({
-                    "isin": isin,
-                    "name": hit.get("openfigi_name"),
-                    "stored": stored,
-                    "parsed": parsed,
-                    "delta": round(abs((parsed or 0) - (stored or 0)), 6),
-                })
+        # Collect coupon upgrade details and build the write rows in one pass.
+        # No per-ISIN get_single() here any more (#1497).
+        batch_hits, batch_upgrades, conv_errors, checked_n, matched_n = _build_hit_rows(
+            batch, hits, dry_run=req.dry_run, errored=errored,
+        )
+        coupon_upgrades.extend(batch_upgrades)
+        conversion_errors += conv_errors
 
-        written = _write_hits(batch, hits, dry_run=req.dry_run, errored=errored)
-        total_checked += len(batch) - len(errored)
-        total_matched += len(hits)
+        written = _write_hits(batch, batch_hits, dry_run=req.dry_run, errored=errored)
+        total_checked += checked_n
+        total_matched += matched_n
         total_written += written
 
         _log_event(
@@ -490,6 +614,7 @@ def enrich(req: EnrichRequest):
     _log_event(
         "enrich_summary", run_id=run_id, checked=total_checked, matched=total_matched,
         written=total_written, batches=batches, coupon_upgrades=len(coupon_upgrades),
+        conversion_errors=conversion_errors,
         duration_s=round(time.monotonic() - run_start, 2),
     )
 
@@ -513,6 +638,7 @@ def enrich(req: EnrichRequest):
         "batches": batches,
         "coupon_upgrades": len(coupon_upgrades),
         "coupon_upgrade_sample": coupon_upgrades[:20],
+        "conversion_errors": conversion_errors,
         "dry_run": req.dry_run,
         "run_id": run_id,
     }
@@ -718,14 +844,16 @@ def brian_manifest():
                 "name": "Batch Enrichment",
                 "description": (
                     "Batch-enrich bond_reference with OpenFIGI data. "
+                    "Requires the enrichment key as 'Authorization: Bearer <key>' "
+                    "(this is a production write). "
                     "Processes unchecked ISINs in bulk and writes results back to Supabase. "
                     "Includes coupon_bbg (fractional coupon from Bloomberg name) for "
                     "precision correction of bonds stored to only 2 decimal places."
                 ),
                 "examples": [
-                    "POST /enrich  {max_isins: 500}",
-                    "POST /enrich  {isins: ['XS1982113463', 'US71654QDD16']}",
-                    "POST /enrich  {dry_run: true, max_isins: 100}",
+                    "POST /enrich  -H 'Authorization: Bearer <key>'  {max_isins: 500}",
+                    "POST /enrich  -H 'Authorization: Bearer <key>'  {isins: ['XS1982113463', 'US71654QDD16']}",
+                    "POST /enrich  -H 'Authorization: Bearer <key>'  {dry_run: true, max_isins: 100}",
                 ],
             },
             {

@@ -95,6 +95,18 @@ def _get_key(name: str) -> str:
     return val
 
 
+def get_service_key() -> str:
+    """The Supabase service-role key, for the write-path credential gate.
+
+    This module already holds the credential that authorises a write to
+    bond_reference (see _ensure_config); server.py's /enrich gate compares
+    callers against it so the service has exactly one Supabase credential
+    rather than a second copy. Never log or return it in a response body.
+    """
+    _ensure_config()
+    return _cfg["key"]
+
+
 def _ensure_config() -> None:
     if not _cfg.get("key"):
         _cfg["url"] = _get_key("BOND_DATA_SUPABASE_URL") or _get_key("SUPABASE_URL")
