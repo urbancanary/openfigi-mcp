@@ -214,3 +214,42 @@ def test_write_rows_keep_the_same_key_set(monkeypatch):
     hits = {"XS1": {"openfigi_name": "T 2 7/8 05/15/32"}}
     rows, _, _, _, _ = server._build_hit_rows(["XS1"], hits, dry_run=False)
     assert set(rows["XS1"].keys()) == {"isin", "openfigi_checked_at", "coupon_bbg", *server._OPENFIGI_FIELDS}
+
+
+# ── The published inbound contract must match the code it describes ────────
+#
+# #1487 left a consuming repo's lane guessing which credential to send: the
+# manifest said `Bearer <key>` without saying which auth-mcp value mints it,
+# and the etf-scraper handoff proposed a token of unspecified origin. These
+# tests make the published contract falsifiable, so a rename in the resolver
+# cannot silently leave the manifest and the 401 describing a key nobody has.
+
+def test_published_key_names_match_the_resolver():
+    """
+    ENRICH_KEY_AUTH_MCP_NAMES is documentation; _ensure_config is the code.
+    Assert the documented order against the real source so they cannot drift.
+    """
+    import inspect
+    import supabase_writer
+    src = inspect.getsource(supabase_writer._ensure_config)
+    key_line = [ln for ln in src.splitlines() if "BOND_DATA_SUPABASE_SERVICE_KEY" in ln]
+    assert key_line, "resolver no longer reads BOND_DATA_SUPABASE_SERVICE_KEY"
+    # The first published name must be the first one the resolver tries.
+    assert server.ENRICH_KEY_AUTH_MCP_NAMES[0] == "BOND_DATA_SUPABASE_SERVICE_KEY"
+    for name in server.ENRICH_KEY_AUTH_MCP_NAMES:
+        assert name in key_line[0], f"{name} documented but not resolved by _ensure_config"
+
+
+def test_manifest_publishes_where_the_key_comes_from(client):
+    body = client.get("/brian-manifest").json()
+    cap = next(c for c in body["capabilities"] if c["name"] == "Batch Enrichment")
+    assert "BOND_DATA_SUPABASE_SERVICE_KEY" in cap["description"], cap["description"]
+    assert "auth-mcp" in cap["description"]
+
+
+def test_401_names_the_contract_but_never_the_value(client, monkeypatch):
+    _stub_enrich_body(monkeypatch)
+    r = client.post("/enrich", json={"isins": []}, headers={"Authorization": "Bearer wrong"})
+    assert r.status_code == 401
+    assert "BOND_DATA_SUPABASE_SERVICE_KEY" in r.text, "a rejected caller must learn which key to fetch"
+    assert SERVICE_KEY not in r.text, "the contract must never leak the value"
